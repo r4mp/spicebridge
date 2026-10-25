@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from spicebridge.sanitize import safe_path, validate_filename
-from spicebridge.schematic import ParsedComponent, _is_ground, parse_netlist
+from spicebridge.schematic import (
+    ParsedComponent,
+    _is_ground,
+    _split_params,
+    parse_netlist,
+)
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -28,6 +34,8 @@ class KiCadSymbolInfo:
     # Distance from the symbol origin to the Reference/Value fields when the
     # fields are placed beside the body
     field_dx: float = 2.54
+    # Pin names of generated subcircuit symbols (the .subckt ports)
+    pin_names: list[str] | None = None
 
 
 @dataclass
@@ -151,12 +159,14 @@ def _resolve_symbol_info(
     value: str,
     model_types: dict[str, str] | None = None,
     n_nodes: int = 0,
+    subckt_ports: dict[str, list[str]] | None = None,
 ) -> KiCadSymbolInfo:
     """Return the KiCadSymbolInfo for a SPICE component type and value.
 
     ``model_types`` (from ``_model_types``) resolves the polarity of Q/M/J
     devices from their .model card; the model name is used as a fallback.
-    ``n_nodes`` sizes the generated subcircuit symbol.
+    ``n_nodes`` sizes the generated subcircuit symbol; with ``subckt_ports``
+    (from ``_subckt_ports``) its pins are named after the .subckt ports.
     """
     model = value.split()[0].lower() if value.split() else ""
     hint = (model_types or {}).get(model, "") + " " + value.lower()
@@ -173,12 +183,23 @@ def _resolve_symbol_info(
             return _SYMBOL_MAP["J_P"]
         return _SYMBOL_MAP["J_N"]
     if comp_type == "X":
+        ports = (subckt_ports or {}).get(model)
+        if ports and len(ports) == n_nodes:
+            return KiCadSymbolInfo(
+                _subckt_named_lib_id(model),
+                [str(i + 1) for i in range(n_nodes)],
+                [(-7.62, -y) for y in _subckt_pin_ys(n_nodes)],
+                pin_names=ports,
+            )
         n_pins = _subckt_pin_count(n_nodes)
         return KiCadSymbolInfo(
             _subckt_lib_id(n_pins),
             [str(i + 1) for i in range(n_pins)],
             [(-7.62, -y) for y in _subckt_pin_ys(n_pins)],
         )
+    if comp_type in ("E", "G") and n_nodes == 2:
+        # Behavioral form (VALUE=, POLY, TABLE...): only output pins
+        return _SYMBOL_MAP["B"]
     if comp_type in _SYMBOL_MAP:
         return _SYMBOL_MAP[comp_type]
     return _FALLBACK_SYMBOL
@@ -203,32 +224,76 @@ def _subckt_lib_id(n_pins: int) -> str:
     return f"Simulation_SPICE:SUBCKT_{n_pins}"
 
 
+def _subckt_named_lib_id(subckt_name: str) -> str:
+    """lib_id of the generated symbol for a subcircuit with named ports."""
+    return "Subcircuit:" + re.sub(r"[^A-Za-z0-9_.-]", "_", subckt_name)
+
+
+def _subckt_ports(netlist: str) -> dict[str, list[str]]:
+    """Map lowercase .subckt names to their port names (parameters dropped)."""
+    lines: list[str] = []
+    for line in netlist.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("+") and lines:
+            lines[-1] += " " + stripped[1:]
+        else:
+            lines.append(stripped)
+    ports: dict[str, list[str]] = {}
+    for line in lines:
+        tokens = line.split()
+        if len(tokens) >= 2 and tokens[0].lower() == ".subckt":
+            ports[tokens[1].lower()] = _split_params(tokens[2:])[0]
+    return ports
+
+
 def _subckt_pin_ys(n_pins: int) -> list[float]:
     """Pin y positions in lib coordinates (Y up), top to bottom, on grid."""
     top = math.ceil((n_pins - 1) / 2) * _GRID
     return [_mm(top - i * _GRID) for i in range(n_pins)]
 
 
-def _subckt_symbol(n_pins: int) -> str:
-    """Lib symbol for a subcircuit box with ``n_pins`` pins on the left edge."""
-    lib_id = _subckt_lib_id(n_pins)
+def _subckt_box(
+    n_pins: int, pin_names: list[str] | None = None
+) -> tuple[float, float, float]:
+    """Right, top and bottom edge of the subcircuit box in lib coordinates.
+
+    The left edge is always at -5.08; the box grows to the right so the
+    longest pin name fits (about 1.27 mm per character at 1.27 mm font size).
+    """
+    ys = _subckt_pin_ys(n_pins)
+    longest = max((len(n) for n in pin_names), default=0) if pin_names else 0
+    width = max(10.16, math.ceil((longest * 1.27 + 2.54) / _GRID) * _GRID)
+    return _mm(-5.08 + width), _mm(ys[0] + _GRID), _mm(ys[-1] - _GRID)
+
+
+def _subckt_symbol(
+    n_pins: int, lib_id: str | None = None, pin_names: list[str] | None = None
+) -> str:
+    """Lib symbol for a subcircuit box with ``n_pins`` pins on the left edge.
+
+    Pins are named after ``pin_names`` (the .subckt ports) when given, else
+    numbered. Reference and Value sit above and below the box.
+    """
+    lib_id = lib_id or _subckt_lib_id(n_pins)
     name = lib_id.split(":", 1)[1]
     ys = _subckt_pin_ys(n_pins)
-    top, bottom = _mm(ys[0] + _GRID), _mm(ys[-1] - _GRID)
+    right, top, bottom = _subckt_box(n_pins, pin_names)
+    center = _mm((right - 5.08) / 2)
+    names = pin_names or [str(i + 1) for i in range(n_pins)]
     font = "(effects (font (size 1.27 1.27)))"
     pins = "\n".join(
-        f'        (pin passive line (at -7.62 {y:g} 0) (length 2.54) (name "{i + 1}" '
-        f'{font}) (number "{i + 1}" {font}))'
-        for i, y in enumerate(ys)
+        f"        (pin passive line (at -7.62 {y:g} 0) (length 2.54) "
+        f'(name "{_escape(pin_name)}" {font}) (number "{i + 1}" {font}))'
+        for i, (y, pin_name) in enumerate(zip(ys, names, strict=True))
     )
     return f"""
     (symbol "{lib_id}" (pin_numbers hide) (pin_names (offset 1.016)) (exclude_from_sim no) (in_bom yes) (on_board yes)
-      (property "Reference" "X" (at 0 1.27 0) {font})
-      (property "Value" "SUBCKT" (at 0 -1.27 0) {font})
+      (property "Reference" "X" (at {center:g} {_mm(top + 1.27):g} 0) {font})
+      (property "Value" "SUBCKT" (at {center:g} {_mm(bottom - 1.27):g} 0) {font})
       (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
       (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
       (symbol "{name}_0_1"
-        (rectangle (start -5.08 {bottom:g}) (end 5.08 {top:g})
+        (rectangle (start -5.08 {bottom:g}) (end {right:g} {top:g})
           (stroke (width 0.254) (type default)) (fill (type background))
         )
       )
@@ -304,6 +369,7 @@ def _vertical_extent(
 def _layout_components(
     components: list[ParsedComponent],
     model_types: dict[str, str] | None = None,
+    subckt_ports: dict[str, list[str]] | None = None,
 ) -> list[PlacedComponent]:
     """Assign positions to components using column-based layout.
 
@@ -333,10 +399,17 @@ def _layout_components(
         cursor = _Y_START
         for comp in column:
             sym = _resolve_symbol_info(
-                comp.comp_type, comp.value, model_types, len(comp.nodes)
+                comp.comp_type,
+                comp.value,
+                model_types,
+                len(comp.nodes),
+                subckt_ports,
             )
             rotation = _choose_rotation(sym, horizontal)
-            above, below = _vertical_extent(sym, rotation, len(comp.nodes))
+            above, below = _vertical_extent(sym, rotation, len(sym.pin_offsets))
+            if comp.comp_type == "X":
+                # Reference/Value sit above and below the subcircuit box
+                above, below = above + _GRID, below + _GRID
             y = _snap_to_grid(math.ceil((cursor + above) / _GRID) * _GRID)
             placed.append(PlacedComponent(comp, x, y, rotation, sym))
             cursor = y + below + _Y_GAP
@@ -417,13 +490,24 @@ def _on_segment(p: tuple[float, float], wire: Wire, eps: float = 1e-6) -> bool:
 
 
 def _body_box(placed: PlacedComponent) -> tuple[float, float, float, float]:
-    """Approximate body of a placed component: its pins plus the origin area.
+    """Approximate body of a placed component: its pins, the origin area and
+    the Reference/Value text (about 1.27 mm per character).
 
     Returns (x_min, y_min, x_max, y_max).
     """
     pins = _pin_positions(placed)
     xs = [p[0] for p in pins] + [placed.x - 1.27, placed.x + 1.27]
     ys = [p[1] for p in pins] + [placed.y - 1.27, placed.y + 1.27]
+    ref_pos, value_pos, justify = _field_positions(placed)
+    for (fx, fy), text in (
+        (ref_pos, placed.component.ref),
+        (value_pos, placed.component.value),
+    ):
+        width = len(text) * 1.27
+        xs += (
+            [fx, fx + width] if justify == "left" else [fx - width / 2, fx + width / 2]
+        )
+        ys += [fy - 0.635, fy + 0.635]
     return min(xs), min(ys), max(xs), max(ys)
 
 
@@ -957,8 +1041,13 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
 }
 
 
-def _lib_symbol_text(lib_id: str) -> str | None:
-    """Return the lib symbol definition for a lib_id (subcircuits generated)."""
+def _lib_symbol_text(lib_id: str, pin_names: list[str] | None = None) -> str | None:
+    """Return the lib symbol definition for a lib_id (subcircuits generated).
+
+    ``pin_names`` are required for subcircuits with named ports.
+    """
+    if pin_names:
+        return _subckt_symbol(len(pin_names), lib_id, pin_names)
     if lib_id in _LIB_SYMBOL_TEMPLATES:
         return _LIB_SYMBOL_TEMPLATES[lib_id]
     if lib_id == _subckt_lib_id(_SUBCKT_MIN_PINS):
@@ -969,12 +1058,19 @@ def _lib_symbol_text(lib_id: str) -> str | None:
     return None
 
 
-def _build_lib_symbols(used_lib_ids: set[str], include_gnd: bool = False) -> str:
-    """Assemble lib_symbols section with only the templates actually used."""
+def _build_lib_symbols(
+    used_lib_ids: set[str],
+    include_gnd: bool = False,
+    pin_names: dict[str, list[str]] | None = None,
+) -> str:
+    """Assemble lib_symbols section with only the templates actually used.
+
+    ``pin_names`` maps the lib_ids of named subcircuit symbols to their ports.
+    """
     parts: list[str] = []
     parts.append("  (lib_symbols")
     for lib_id in sorted(used_lib_ids):
-        text = _lib_symbol_text(lib_id)
+        text = _lib_symbol_text(lib_id, (pin_names or {}).get(lib_id))
         if text is not None:
             parts.append(text)
     if include_gnd:
@@ -991,6 +1087,11 @@ def _build_lib_symbols(used_lib_ids: set[str], include_gnd: bool = False) -> str
 def _uid() -> str:
     """Generate a KiCad-compatible UUID."""
     return str(uuid.uuid4())
+
+
+def _escape(text: str) -> str:
+    """Escape a string for use inside a quoted S-expression string."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _emit_header(sheet_uuid: str) -> str:
@@ -1010,12 +1111,15 @@ def _field_positions(
 ) -> tuple[tuple[float, float], tuple[float, float], str]:
     """Positions of the Reference and Value fields, plus their justification.
 
-    Subcircuits get both fields centred inside the box, horizontal 2-pin parts
-    above and below the body, everything else to the right of the body.
+    Subcircuits get the fields centred above and below the box, horizontal
+    2-pin parts above and below the body, everything else to the right.
     """
     x, y = placed.x, placed.y
+    sym = placed.symbol_info
     if placed.component.comp_type == "X":
-        return (x, _mm(y - 1.27)), (x, _mm(y + 1.27)), ""
+        right, top, bottom = _subckt_box(len(sym.pin_numbers), sym.pin_names)
+        cx = _mm(x + (right - 5.08) / 2)
+        return (cx, _mm(y - top - 1.27)), (cx, _mm(y - bottom + 1.27)), ""
     pins = _pin_positions(placed)
     if len(pins) == 2 and pins[0][1] == pins[1][1]:
         return (x, _mm(y - 2.54)), (x, _mm(y + 2.54)), ""
@@ -1048,7 +1152,7 @@ def _emit_symbol_instance(placed: PlacedComponent, sheet_uuid: str) -> str:
     props = [
         f'      (property "Reference" "{comp.ref}" (at {rx} {ry} {fa})'
         f"\n        {effects})",
-        f'      (property "Value" "{comp.value}" (at {vx} {vy} {fa})'
+        f'      (property "Value" "{_escape(comp.value)}" (at {vx} {vy} {fa})'
         f"\n        {effects})",
         f'      (property "Footprint" "" (at {placed.x} {placed.y} 0)'
         f"\n        (effects (font (size 1.27 1.27)) hide))",
@@ -1221,6 +1325,8 @@ def export_kicad_schematic(
                 )
             comp.nodes = comp.nodes[:3]
 
+    subckt_ports = _subckt_ports(netlist)
+
     # Elements that are not drawn, and types without a dedicated symbol
     drawn: list[ParsedComponent] = []
     for comp in components:
@@ -1241,13 +1347,26 @@ def export_kicad_schematic(
                 f"exported as a 2-pin placeholder (only the first two nodes "
                 f"are connected)"
             )
+        if comp.comp_type in ("E", "G") and comp.value.lower().startswith("poly"):
+            warnings.append(
+                f"{comp.ref}: controlling nodes of POLY sources are not drawn; "
+                f"they are listed in the value field"
+            )
+        if comp.comp_type == "X" and comp.value:
+            subckt = comp.value.split()[0].lower()
+            ports = subckt_ports.get(subckt)
+            if ports is not None and len(ports) != len(comp.nodes):
+                warnings.append(
+                    f"{comp.ref}: {len(comp.nodes)} nodes but subcircuit "
+                    f"'{subckt}' has {len(ports)} ports; pins are numbered"
+                )
         drawn.append(comp)
     components = drawn
 
     sheet_uuid = _uid()
 
     # Layout
-    placed = _layout_components(components, _model_types(netlist))
+    placed = _layout_components(components, _model_types(netlist), subckt_ports)
 
     # Wire routing
     wires, junctions, unrouted = _route_nets(placed)
@@ -1260,8 +1379,11 @@ def export_kicad_schematic(
 
     # Collect used lib_ids
     used_lib_ids: set[str] = set()
+    pin_names: dict[str, list[str]] = {}
     for pc in placed:
         used_lib_ids.add(pc.symbol_info.lib_id)
+        if pc.symbol_info.pin_names:
+            pin_names[pc.symbol_info.lib_id] = pc.symbol_info.pin_names
 
     # Build output
     parts: list[str] = []
@@ -1270,7 +1392,7 @@ def export_kicad_schematic(
     parts.append(_emit_header(sheet_uuid))
 
     # Lib symbols
-    parts.append(_build_lib_symbols(used_lib_ids, include_gnd=bool(ground_positions)))
+    parts.append(_build_lib_symbols(used_lib_ids, bool(ground_positions), pin_names))
     parts.append("")
 
     # Symbol instances

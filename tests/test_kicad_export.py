@@ -15,10 +15,13 @@ from spicebridge.kicad_export import (
     _find_ground_pins,
     _find_net_labels,
     _layout_components,
+    _model_types,
     _pin_positions,
     _resolve_symbol_info,
     _route_wires,
     _snap_to_grid,
+    _subckt_box,
+    _subckt_ports,
     export_kicad_schematic,
 )
 from spicebridge.schematic import parse_netlist
@@ -529,6 +532,34 @@ R2 h 0 1k
 R3 c d 1k
 """
 
+BEHAVIORAL_CIRCUIT = """\
+* Behavioral E/G forms
+V1 a 0 dc 1
+R1 a b 1k
+E1 b 0 VALUE={V(a)*2}
+G1 c 0 cur=V(a)*1m
+R2 c 0 1k
+E2 d 0 POLY(1) a 0 0 3
+R3 d b 1k
+"""
+
+NAMED_SUBCKT_CIRCUIT = """\
+* Subcircuits with named ports
+.subckt opamp3 inp inn
++ out params: gain=1e5
+E1 out 0 inp inn {gain}
+.ends opamp3
+.subckt filter_stage in out gnd
+R1 in out 1k
+C1 out gnd 1n
+.ends
+V1 in 0 dc 1
+X1 in fb out opamp3 gain=1e4
+R1 out fb 10k
+X2 out filt 0 filter_stage
+R2 filt 0 1k
+"""
+
 COUPLED_INDUCTORS_CIRCUIT = """\
 * Transformer
 V1 a 0 ac 1
@@ -643,6 +674,8 @@ def _expected_nets(netlist: str) -> list[set[str]]:
         JFET_CIRCUIT,
         WIDE_SUBCKT_CIRCUIT,
         COUPLED_INDUCTORS_CIRCUIT,
+        BEHAVIORAL_CIRCUIT,
+        NAMED_SUBCKT_CIRCUIT,
     ],
 )
 def test_exported_connectivity_matches_netlist(netlist, tmp_path):
@@ -659,8 +692,11 @@ def test_exported_connectivity_matches_netlist(netlist, tmp_path):
 def test_symbol_map_offsets_match_lib_templates():
     infos = [*_SYMBOL_MAP.values()]
     infos += [_resolve_symbol_info("X", "sub", n_nodes=n) for n in (2, 5, 6, 9)]
+    ports = {"named": ["in", "out", "very_long_port_name"]}
+    infos.append(_resolve_symbol_info("X", "named", n_nodes=3, subckt_ports=ports))
     lib_ids = {info.lib_id for info in infos}
-    tree = _sexp("(root " + _build_lib_symbols(lib_ids) + ")")
+    pin_names = {i.lib_id: i.pin_names for i in infos if i.pin_names}
+    tree = _sexp("(root " + _build_lib_symbols(lib_ids, False, pin_names) + ")")
     lib_pins = _lib_pin_positions(tree)
     assert set(lib_pins) == lib_ids
     for info in infos:
@@ -725,12 +761,14 @@ _LAYOUT_CIRCUITS = [
     JFET_CIRCUIT,
     WIDE_SUBCKT_CIRCUIT,
     DIODE_SUBCKT_CIRCUIT,
+    BEHAVIORAL_CIRCUIT,
+    NAMED_SUBCKT_CIRCUIT,
 ]
 
 
 def _placed(netlist):
     comps = [c for c in parse_netlist(netlist) if c.comp_type != "K"]
-    return _layout_components(comps)
+    return _layout_components(comps, _model_types(netlist), _subckt_ports(netlist))
 
 
 @pytest.mark.parametrize("netlist", _LAYOUT_CIRCUITS)
@@ -771,3 +809,69 @@ def test_labels_and_ground_point_away_from_component(netlist):
         dx, dy = _DIRECTION_VECTORS[direction]
         # Pointing towards the component origin would draw over the body
         assert (ox - x) * dx + (oy - y) * dy <= 0, (x, y, direction)
+
+
+# --- Behavioral sources and named subcircuit pins ---
+
+
+def _lib_pin_names(tree, lib_id: str) -> list[str]:
+    (lib,) = _children(tree, "lib_symbols")
+    (sym,) = [s for s in lib[1:] if s[1].strip(chr(34)) == lib_id]
+    names = []
+    for unit in _children(sym, "symbol"):
+        for pin in _children(unit, "pin"):
+            (name,) = _children(pin, "name")
+            names.append(name[1].strip(chr(34)))
+    return names
+
+
+def test_behavioral_sources_use_two_pin_symbol(tmp_path):
+    lib_ids = _placed_lib_ids(BEHAVIORAL_CIRCUIT, tmp_path)
+    assert lib_ids["E1"] == "Simulation_SPICE:BSOURCE"
+    assert lib_ids["G1"] == "Simulation_SPICE:BSOURCE"
+    assert lib_ids["E2"] == "Simulation_SPICE:BSOURCE"
+
+
+def test_poly_source_warns_about_control_nodes(tmp_path):
+    _, warnings = export_kicad_schematic(BEHAVIORAL_CIRCUIT, output_dir=tmp_path)
+    assert [w for w in warnings if w.startswith("E2:")]
+    assert not [w for w in warnings if w.startswith(("E1:", "G1:"))]
+
+
+def test_subckt_pins_named_after_ports(tmp_path):
+    path, warnings = export_kicad_schematic(NAMED_SUBCKT_CIRCUIT, output_dir=tmp_path)
+    tree = _sexp(path.read_text())
+    lib_ids = _placed_lib_ids(NAMED_SUBCKT_CIRCUIT, tmp_path)
+    assert lib_ids["X1"] == "Subcircuit:opamp3"
+    assert lib_ids["X2"] == "Subcircuit:filter_stage"
+    # Continuation lines and params: are handled
+    assert _lib_pin_names(tree, "Subcircuit:opamp3") == ["inp", "inn", "out"]
+    assert _lib_pin_names(tree, "Subcircuit:filter_stage") == ["in", "out", "gnd"]
+    assert warnings == []
+
+
+def test_subckt_port_count_mismatch_falls_back_to_numbers(tmp_path):
+    netlist = NAMED_SUBCKT_CIRCUIT.replace("X2 out filt 0", "X2 out filt")
+    _, warnings = export_kicad_schematic(netlist, output_dir=tmp_path)
+    assert any(w.startswith("X2:") and "3 ports" in w for w in warnings)
+    assert _placed_lib_ids(netlist, tmp_path)["X2"] == "Simulation_SPICE:SUBCKT"
+
+
+def test_undefined_subckt_keeps_numbered_pins(tmp_path):
+    assert _placed_lib_ids(DIODE_SUBCKT_CIRCUIT, tmp_path)["X1"] == (
+        "Simulation_SPICE:SUBCKT"
+    )
+
+
+def test_subckt_box_fits_long_pin_names():
+    short = _subckt_box(3, ["a", "b", "c"])
+    long = _subckt_box(3, ["a", "b", "a_very_long_port_name"])
+    assert short[0] == pytest.approx(5.08)
+    assert long[0] > short[0]
+    assert (long[0] + 5.08) >= len("a_very_long_port_name") * 1.27
+
+
+def test_value_with_quotes_is_escaped(tmp_path):
+    netlist = '* t\nV1 a 0 dc 1\nB1 b 0 V="V(a)"\nR1 b 0 1k\n'
+    path, _ = export_kicad_schematic(netlist, output_dir=tmp_path)
+    _sexp(path.read_text())  # parses, i.e. quotes did not break the file
