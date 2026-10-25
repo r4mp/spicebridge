@@ -1,5 +1,6 @@
 """Tests for spicebridge.kicad_export — KiCad 8 schematic export."""
 
+import math
 import re
 import tempfile
 from pathlib import Path
@@ -7,6 +8,9 @@ from pathlib import Path
 import pytest
 
 from spicebridge.kicad_export import (
+    _LIB_SYMBOL_TEMPLATES,
+    _SYMBOL_MAP,
+    _build_lib_symbols,
     _find_ground_pins,
     _layout_components,
     _resolve_symbol_info,
@@ -85,7 +89,8 @@ class TestSymbolMapping:
     def test_diode_mapping(self):
         info = _resolve_symbol_info("D", "1N4148")
         assert info.lib_id == "Device:D"
-        assert info.pin_numbers == ["K", "A"]
+        # SPICE diode node order is anode, cathode
+        assert info.pin_numbers == ["A", "K"]
 
     def test_voltage_source_mapping(self):
         info = _resolve_symbol_info("V", "dc 5")
@@ -361,7 +366,7 @@ class TestIntegration:
 # --- Regression tests for issue #5 ---
 
 ISSUE5_NETLIST = """\
-Sallen-Key Lowpass Butterworth fc~1kHz, OpAmp korrekt gegengekoppelt
+Sallen-Key lowpass Butterworth fc~1kHz, op-amp with negative feedback
 V1 in 0 dc 0 ac 1
 R1 in n1 10k
 R2 n1 n2 10k
@@ -372,7 +377,16 @@ E1 out 0 n2 out 100k
 .end
 """
 
-_PRIMITIVE_CHILDREN = {"pts", "stroke", "fill", "start", "mid", "end", "center", "radius"}
+_PRIMITIVE_CHILDREN = {
+    "pts",
+    "stroke",
+    "fill",
+    "start",
+    "mid",
+    "end",
+    "center",
+    "radius",
+}
 
 
 def _sexp(text: str):
@@ -416,7 +430,11 @@ class TestIssue5:
                     if prim[0] == "pin":
                         continue
                     for child in prim[1:]:
-                        assert child[0] in _PRIMITIVE_CHILDREN, (sym[1], prim[0], child[0])
+                        assert child[0] in _PRIMITIVE_CHILDREN, (
+                            sym[1],
+                            prim[0],
+                            child[0],
+                        )
 
     def test_placed_symbols_pin_before_instances_and_no_pin_names(self, issue5_tree):
         placed = _children(issue5_tree, "symbol")
@@ -449,3 +467,145 @@ X1 in out out ideal_opamp
 """
     refs = [c.ref for c in parse_netlist(netlist)]
     assert refs == ["V1", "X1"]
+
+
+# --- Connectivity: exported schematic must match the SPICE netlist ---
+
+# SPICE node order -> KiCad pin number, independent of _SYMBOL_MAP
+_SPICE_PIN_ORDER = {
+    "D": ["A", "K"],
+    "Q": ["C", "B", "E"],
+    "M": ["D", "G", "S"],
+    "X": ["1", "2", "3", "4", "5"],
+}
+
+DIODE_SUBCKT_CIRCUIT = """\
+* Diode clamp with subcircuit
+V1 in 0 dc 5
+R1 in a 1k
+D1 a k 1N4148
+R2 k 0 10k
+X1 a k out 0 mysub
+"""
+
+
+def _lib_pin_positions(tree) -> dict[str, dict[str, tuple[float, float]]]:
+    """Map lib_id -> pin number -> pin position in lib coordinates (Y up)."""
+    (lib,) = _children(tree, "lib_symbols")
+    result: dict[str, dict[str, tuple[float, float]]] = {}
+    for sym in lib[1:]:
+        pins: dict[str, tuple[float, float]] = {}
+        for unit in _children(sym, "symbol"):
+            for pin in _children(unit, "pin"):
+                (at,) = _children(pin, "at")
+                (number,) = _children(pin, "number")
+                pins[number[1].strip('"')] = (float(at[1]), float(at[2]))
+        result[sym[1].strip('"')] = pins
+    return result
+
+
+def _kicad_nets(tree) -> list[set[str]]:
+    """Compute connectivity the way KiCad does: pins, wires, labels, GND."""
+    parent: dict = {}
+
+    def find(a):
+        parent.setdefault(a, a)
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    def pt(x, y):
+        return (round(float(x), 3), round(float(y), 3))
+
+    lib_pins = _lib_pin_positions(tree)
+    points: list[tuple[float, float]] = []
+
+    for sym in _children(tree, "symbol"):
+        lib_id = _children(sym, "lib_id")[0][1].strip('"')
+        _, x, y, rot = _children(sym, "at")[0]
+        x, y, a = float(x), float(y), math.radians(float(rot))
+        ref = next(
+            p[2].strip('"') for p in _children(sym, "property") if p[1] == '"Reference"'
+        )
+        for number, (lx, ly) in lib_pins[lib_id].items():
+            sx, sy = lx, -ly  # lib Y up -> schematic Y down
+            px = x + sx * math.cos(a) + sy * math.sin(a)
+            py = y - sx * math.sin(a) + sy * math.cos(a)
+            p = pt(px, py)
+            points.append(p)
+            union(p, "GND" if lib_id == "power:GND" else f"{ref}.{number}")
+
+    wires = []
+    for w in _children(tree, "wire"):
+        (pts,) = _children(w, "pts")
+        a, b = pt(*pts[1][1:3]), pt(*pts[2][1:3])
+        wires.append((a, b))
+        points += [a, b]
+        union(a, b)
+
+    for lbl in _children(tree, "label"):
+        p = pt(*_children(lbl, "at")[0][1:3])
+        points.append(p)
+        union(p, "label:" + lbl[1].strip('"'))
+
+    # Anything touching a wire segment is connected to it
+    for (x1, y1), (x2, y2) in wires:
+        for p in points:
+            if min(x1, x2) <= p[0] <= max(x1, x2) and min(y1, y2) <= p[1] <= max(
+                y1, y2
+            ):
+                union(p, (x1, y1))
+
+    groups: dict = {}
+    for key in list(parent):
+        if isinstance(key, str) and "." in key and not key.startswith("label:"):
+            groups.setdefault(find(key), set()).add(key)
+    return list(groups.values())
+
+
+def _expected_nets(netlist: str) -> list[set[str]]:
+    nets: dict[str, set[str]] = {}
+    for comp in parse_netlist(netlist):
+        order = _SPICE_PIN_ORDER.get(comp.comp_type, ["1", "2"])
+        for node, number in zip(comp.nodes, order, strict=False):
+            key = "0" if node.lower() in ("0", "gnd") else node
+            nets.setdefault(key, set()).add(f"{comp.ref}.{number}")
+    return list(nets.values())
+
+
+@pytest.mark.parametrize(
+    "netlist",
+    [
+        ISSUE5_NETLIST,
+        RC_LOWPASS,
+        VOLTAGE_DIVIDER,
+        BJT_AMPLIFIER,
+        MOSFET_CIRCUIT,
+        PNP_CIRCUIT,
+        DIODE_SUBCKT_CIRCUIT,
+    ],
+)
+def test_exported_connectivity_matches_netlist(netlist, tmp_path):
+    path, _ = export_kicad_schematic(netlist, output_dir=tmp_path)
+    expected = sorted(sorted(g) for g in _expected_nets(netlist))
+    used = {pin for group in expected for pin in group}
+    # Symbol pins without a SPICE node (e.g. spare SUBCKT pins) are ignored
+    actual = sorted(
+        sorted(g & used) for g in _kicad_nets(_sexp(path.read_text())) if g & used
+    )
+    assert actual == expected
+
+
+def test_symbol_map_offsets_match_lib_templates():
+    tree = _sexp("(root " + _build_lib_symbols(set(_LIB_SYMBOL_TEMPLATES)) + ")")
+    lib_pins = _lib_pin_positions(tree)
+    infos = [*_SYMBOL_MAP.values(), _resolve_symbol_info("X", "sub")]
+    for info in infos:
+        pins = lib_pins[info.lib_id]
+        for number, (dx, dy) in zip(info.pin_numbers, info.pin_offsets, strict=True):
+            lx, ly = pins[number]
+            assert (dx, dy) == pytest.approx((lx, -ly)), (info.lib_id, number)
