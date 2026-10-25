@@ -235,3 +235,40 @@ class TestSharedLayout:
         _, _, vb_w, vb_h = (float(v) for v in root.get("viewBox").split())
         assert float(root.get("width")) == vb_w
         assert float(root.get("height")) == vb_h
+
+
+class TestHoverTargets:
+    """Hovering must work inside open outlines and on thin wires."""
+
+    def test_every_component_has_a_hit_area(self):
+        root = ET.fromstring(render_svg(SALLEN_KEY))
+        for ref in ("V1", "R1", "R2", "C1", "C2", "E1"):
+            hits = [
+                el for el in _group(root, ref).iter() if el.get("class") == "comp-hit"
+            ]
+            assert len(hits) == 1, ref
+
+    def test_every_wire_has_a_wide_hit_line_on_the_same_net(self):
+        root = ET.fromstring(render_svg(SALLEN_KEY))
+
+        def wires(cls):
+            return sorted(
+                (w.get("x1"), w.get("y1"), w.get("x2"), w.get("y2"), w.get("data-node"))
+                for w in root.iter()
+                if w.get("class") == cls
+            )
+
+        assert wires("wire") and wires("wire") == wires("wire wire-hit")
+
+
+class TestOperatingPointOverlay:
+    def test_v_node_result_keys_are_annotated(self):
+        """run_dc_op reports node voltages as "v(node)"."""
+        results = {"nodes": {"v(in)": 1.0, "v(OUT)": 0.5, "i(v1)": 0.0}}
+        root = ET.fromstring(render_svg(RC_LOWPASS, results=results))
+        notes = {
+            el.get("data-node"): el.text
+            for el in root.iter()
+            if el.get("class") == "sim-annotation"
+        }
+        assert notes == {"in": "1V", "out": "0.5V"}

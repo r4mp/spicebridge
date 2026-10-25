@@ -17,6 +17,7 @@ from spicebridge.kicad_export import (
     PlacedComponent,
     Scene,
     _field_positions,
+    _obstacle_boxes,
     _pin_directions,
     _pin_positions,
     _rotate,
@@ -281,6 +282,8 @@ def _style(theme: dict[str, str]) -> str:
         .highlight .comp-body {{ stroke: {t["highlight"]} !important; }}
         .highlight .comp-label {{ fill: {t["highlight"]} !important; }}
         .highlight {{ stroke: {t["highlight"]} !important; }}
+        .comp-hit {{ fill: transparent; stroke: none; pointer-events: all; }}
+        .wire-hit {{ stroke: transparent !important; stroke-width: 10; }}
     """
 
 
@@ -304,17 +307,15 @@ def _draw_scene(
 
     for wire in scene.wires:
         (x1, y1), (x2, y2) = canvas.px(*wire.start), canvas.px(*wire.end)
+        ends = {"x1": str(x1), "y1": str(y1), "x2": str(x2), "y2": str(y2)}
+        ET.SubElement(
+            canvas.root, "line", {**ends, "class": "wire", "data-node": wire.net}
+        )
+        # Wider invisible copy so the thin wire is easy to hover
         ET.SubElement(
             canvas.root,
             "line",
-            {
-                "x1": str(x1),
-                "y1": str(y1),
-                "x2": str(x2),
-                "y2": str(y2),
-                "class": "wire",
-                "data-node": wire.net,
-            },
+            {**ends, "class": "wire wire-hit", "data-node": wire.net},
         )
 
     for jx, jy in scene.junctions:
@@ -334,7 +335,10 @@ def _draw_scene(
         _draw_net_label(canvas, lx, ly, name, direction)
 
     if results:
-        for node, voltage in results.get("nodes", {}).items():
+        for key, voltage in results.get("nodes", {}).items():
+            # Operating point results name node voltages "v(node)"
+            match = re.fullmatch(r"v\((.+)\)", key, re.IGNORECASE)
+            node = match.group(1).lower() if match else key
             if node in node_pins and isinstance(voltage, (int, float)):
                 (nx, ny), direction = node_pins[node]
                 _draw_annotation(canvas, nx, ny, f"{voltage:.4g}V", node, direction)
@@ -370,6 +374,19 @@ def _draw_component(canvas: _Canvas, scene: Scene, pc: PlacedComponent) -> None:
             "data-type": comp.comp_type,
             "data-value": comp.value,
             "class": "component",
+        },
+    )
+    # Invisible area over the body so hovering works inside open outlines
+    x1, y1, x2, y2 = _obstacle_boxes(pc)[0]
+    ET.SubElement(
+        group,
+        "rect",
+        {
+            "x": str(round(x1 * _PX, 2)),
+            "y": str(round(y1 * _PX, 2)),
+            "width": str(round((x2 - x1) * _PX, 2)),
+            "height": str(round((y2 - y1) * _PX, 2)),
+            "class": "comp-hit",
         },
     )
     text = scene.lib_symbols.get(pc.symbol_info.lib_id)
