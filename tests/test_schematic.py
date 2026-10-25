@@ -179,7 +179,19 @@ class TestDrawSchematic:
             result = draw_schematic(RC_LOWPASS, out, fmt="png")
             assert result == out
             assert out.exists()
-            assert os.path.getsize(out) > 0
+            assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_svg_matches_the_web_viewer_drawing(self):
+        from spicebridge.svg_renderer import render_svg
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "schematic.svg"
+            draw_schematic(RC_LOWPASS, out, fmt="svg")
+            svg = out.read_text()
+        # Same drawing, only the colours (and the natural size) differ
+        expected = render_svg(RC_LOWPASS, width=None, height=None, theme="light")
+        assert svg == expected
+        assert 'class="spicebridge-schematic"' in svg
 
     def test_svg_creation(self):
         with tempfile.TemporaryDirectory() as tmpdir:

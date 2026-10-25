@@ -59,6 +59,7 @@ class Wire:
 
     start: tuple[float, float]
     end: tuple[float, float]
+    net: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -954,7 +955,7 @@ class _Router:
 
 
 def _segments(
-    edges: set[tuple[Cell, Cell]], stops: set[Cell]
+    edges: set[tuple[Cell, Cell]], stops: set[Cell], net: str = ""
 ) -> tuple[list[Wire], list[tuple[float, float]]]:
     """Merge unit grid edges of one net into wires; return (wires, junctions).
 
@@ -992,6 +993,7 @@ def _segments(
                 Wire(
                     (_mm(start[0] * _STEP), _mm(start[1] * _STEP)),
                     (_mm(cur[0] * _STEP), _mm(cur[1] * _STEP)),
+                    net,
                 )
             )
     junctions = [
@@ -1055,7 +1057,7 @@ def _route_nets(
     for net, paths in routed.items():
         edges = {(a, b) for path in paths for a, b in zip(path, path[1:], strict=False)}
         stops = {_cell(p) for p in net_pins[net]}
-        net_wires, net_junctions = _segments(edges, stops)
+        net_wires, net_junctions = _segments(edges, stops, net)
         wires += net_wires
         junctions += net_junctions
     return wires, junctions, unrouted
@@ -1790,6 +1792,87 @@ def export_kicad_schematic(
     """
     validate_filename(filename)
 
+    scene = build_scene(netlist)
+    sheet_uuid = _uid()
+
+    # Build output
+    parts: list[str] = []
+
+    # Header
+    parts.append(_emit_header(sheet_uuid, _paper_size(scene.placed)))
+
+    # Lib symbols
+    parts.append("  (lib_symbols")
+    parts.extend(scene.lib_symbols.values())
+    parts.append("  )")
+    parts.append("")
+
+    # Symbol instances
+    for pc in scene.placed:
+        parts.append(_emit_symbol_instance(pc, sheet_uuid))
+        parts.append("")
+
+    # Wires
+    for wire in scene.wires:
+        parts.append(_emit_wire(wire))
+
+    # Junctions
+    for jx, jy in scene.junctions:
+        parts.append(_emit_junction(jx, jy))
+
+    # Ground power symbols
+    for gx, gy, direction in scene.ground_pins:
+        parts.append(_emit_power_symbol(gx, gy, sheet_uuid, direction))
+        parts.append("")
+
+    # Net labels
+    for lx, ly, name, direction in scene.net_labels:
+        parts.append(_emit_net_label(lx, ly, name, direction))
+
+    # Sheet instances
+    parts.append(_emit_sheet_instances(sheet_uuid))
+
+    # Close
+    parts.append(")")
+
+    content = "\n".join(parts) + "\n"
+
+    # Write file
+    if output_dir is None:
+        output_dir = Path.cwd()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = safe_path(output_dir, filename)
+    output_path.write_text(content, encoding="utf-8")
+
+    return output_path, scene.warnings
+
+
+@dataclass
+class Scene:
+    """A laid-out and routed schematic, ready to be written or drawn."""
+
+    placed: list[PlacedComponent]
+    wires: list[Wire]
+    junctions: list[tuple[float, float]]
+    # (x, y, pin direction) of every pin tied to ground
+    ground_pins: list[tuple[float, float, int]]
+    # (x, y, net name, pin direction)
+    net_labels: list[tuple[float, float, str, int]]
+    # lib_id -> lib symbol definition, including power:GND when used
+    lib_symbols: dict[str, str]
+    warnings: list[str]
+
+
+def build_scene(netlist: str) -> Scene:
+    """Parse, place and route a SPICE netlist.
+
+    This is the common ground of the KiCad export and the SVG renderer, so
+    both show the same drawing.
+
+    Raises:
+        ValueError: If the netlist contains no components.
+    """
     components = parse_netlist(netlist)
     if not components:
         raise ValueError("Netlist contains no components to export")
@@ -1846,8 +1929,6 @@ def export_kicad_schematic(
         drawn.append(comp)
     components = drawn
 
-    sheet_uuid = _uid()
-
     # Layout
     placed = _layout_components(components, _model_types(netlist), subckt_ports)
 
@@ -1855,65 +1936,25 @@ def export_kicad_schematic(
     wires, junctions, unrouted = _route_nets(placed)
 
     # Ground symbols
-    ground_positions = _find_ground_pins(placed)
+    ground_pins = _find_ground_pins(placed)
 
     # Net labels
     net_labels = _find_net_labels(placed, unrouted)
 
-    # Collect used lib_ids
-    used_lib_ids: set[str] = set()
-    pin_names: dict[str, list[str]] = {}
-    for pc in placed:
-        used_lib_ids.add(pc.symbol_info.lib_id)
-        if pc.symbol_info.pin_names:
-            pin_names[pc.symbol_info.lib_id] = pc.symbol_info.pin_names
+    # Lib symbols of the parts in use
+    pin_names = {
+        pc.symbol_info.lib_id: pc.symbol_info.pin_names
+        for pc in placed
+        if pc.symbol_info.pin_names
+    }
+    lib_symbols: dict[str, str] = {}
+    for lib_id in sorted({pc.symbol_info.lib_id for pc in placed}):
+        text = _lib_symbol_text(lib_id, pin_names.get(lib_id))
+        if text is not None:
+            lib_symbols[lib_id] = text
+    if ground_pins:
+        lib_symbols["power:GND"] = _GND_LIB_SYMBOL
 
-    # Build output
-    parts: list[str] = []
-
-    # Header
-    parts.append(_emit_header(sheet_uuid, _paper_size(placed)))
-
-    # Lib symbols
-    parts.append(_build_lib_symbols(used_lib_ids, bool(ground_positions), pin_names))
-    parts.append("")
-
-    # Symbol instances
-    for pc in placed:
-        parts.append(_emit_symbol_instance(pc, sheet_uuid))
-        parts.append("")
-
-    # Wires
-    for wire in wires:
-        parts.append(_emit_wire(wire))
-
-    # Junctions
-    for jx, jy in junctions:
-        parts.append(_emit_junction(jx, jy))
-
-    # Ground power symbols
-    for gx, gy, direction in ground_positions:
-        parts.append(_emit_power_symbol(gx, gy, sheet_uuid, direction))
-        parts.append("")
-
-    # Net labels
-    for lx, ly, name, direction in net_labels:
-        parts.append(_emit_net_label(lx, ly, name, direction))
-
-    # Sheet instances
-    parts.append(_emit_sheet_instances(sheet_uuid))
-
-    # Close
-    parts.append(")")
-
-    content = "\n".join(parts) + "\n"
-
-    # Write file
-    if output_dir is None:
-        output_dir = Path.cwd()
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = safe_path(output_dir, filename)
-    output_path.write_text(content, encoding="utf-8")
-
-    return output_path, warnings
+    return Scene(
+        placed, wires, junctions, ground_pins, net_labels, lib_symbols, warnings
+    )

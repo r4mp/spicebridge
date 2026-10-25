@@ -1,13 +1,9 @@
-"""Netlist-to-schemdraw schematic generator."""
+"""SPICE netlist parser and schematic drawing."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import schemdraw
-import schemdraw.elements as elm
 
 from spicebridge.constants import COMPONENT_NODE_COUNTS
 
@@ -134,144 +130,12 @@ def parse_netlist(netlist: str) -> list[ParsedComponent]:
     return components
 
 
-# Mapping from component type to schemdraw element class
-_ELEMENT_MAP: dict[str, type] = {
-    "R": elm.Resistor,
-    "C": elm.Capacitor,
-    "L": elm.Inductor,
-    "V": elm.SourceV,
-    "I": elm.SourceI,
-    "D": elm.Diode,
-    "Q": elm.BjtNpn,
-    "M": elm.NFet,
-    "X": elm.Opamp,
-}
-
-
-def _is_ac_source(comp: ParsedComponent) -> bool:
-    """Check if a voltage source has AC specification."""
-    return bool(re.search(r"\bac\b", comp.value, re.IGNORECASE))
-
-
-def _classify_components(
-    components: list[ParsedComponent],
-) -> tuple[list[ParsedComponent], list[ParsedComponent], list[ParsedComponent]]:
-    """Split components into sources, series, and shunt lists.
-
-    Sources are voltage (V) or current (I) sources.
-    Shunt components have at least one ground-connected node.
-    Series components are everything else.
-
-    Returns:
-        Tuple of (sources, series, shunt).
-    """
-    sources: list[ParsedComponent] = []
-    series: list[ParsedComponent] = []
-    shunt: list[ParsedComponent] = []
-
-    for comp in components:
-        if comp.comp_type in ("V", "I"):
-            sources.append(comp)
-        elif any(_is_ground(n) for n in comp.nodes):
-            shunt.append(comp)
-        else:
-            series.append(comp)
-
-    return sources, series, shunt
-
-
-def _draw_sources(
-    d: schemdraw.Drawing,
-    sources: list[ParsedComponent],
-    node_positions: dict[str, tuple[float, float]],
-) -> None:
-    """Draw source elements on the drawing going UP from ground.
-
-    Updates node_positions with the start/end positions of each source.
-    """
-    for comp in sources:
-        elem_cls = (
-            elm.SourceSin if _is_ac_source(comp) else _ELEMENT_MAP[comp.comp_type]
-        )
-        e = d.add(elem_cls().up().label(comp.ref))
-        if comp.nodes:
-            node_positions[comp.nodes[0]] = e.end
-            if len(comp.nodes) > 1:
-                node_positions[comp.nodes[1]] = e.start
-
-
-def _draw_series(
-    d: schemdraw.Drawing,
-    series: list[ParsedComponent],
-    node_positions: dict[str, tuple[float, float]],
-) -> None:
-    """Draw series elements going RIGHT.
-
-    Updates node_positions with the start/end positions of each element.
-    """
-    for comp in series:
-        elem_cls = _ELEMENT_MAP.get(comp.comp_type, elm.Resistor)
-        e = d.add(elem_cls().right().label(comp.ref))
-        if comp.nodes:
-            node_positions[comp.nodes[0]] = e.start
-            if len(comp.nodes) > 1:
-                node_positions[comp.nodes[1]] = e.end
-
-
-def _draw_shunt(
-    d: schemdraw.Drawing,
-    shunt: list[ParsedComponent],
-    node_positions: dict[str, tuple[float, float]],
-) -> None:
-    """Draw shunt-to-ground elements going DOWN.
-
-    For each shunt component, if its signal node (non-ground) already has a
-    known position, a short line is drawn from that position before placing
-    the component downward with a ground symbol underneath.
-    """
-    for comp in shunt:
-        elem_cls = _ELEMENT_MAP.get(comp.comp_type, elm.Resistor)
-        # Find the signal node (non-ground)
-        signal_node = None
-        for n in comp.nodes:
-            if not _is_ground(n):
-                signal_node = n
-                break
-
-        if signal_node and signal_node in node_positions:
-            d.add(elm.Line().at(node_positions[signal_node]).down().length(0.5))
-
-        d.add(elem_cls().down().label(comp.ref))
-        d.add(elm.Ground())
-
-
-def _draw_source_grounds(
-    d: schemdraw.Drawing,
-    sources: list[ParsedComponent],
-    node_positions: dict[str, tuple[float, float]],
-) -> None:
-    """Add ground symbols under sources.
-
-    Finds the first source with a ground node that has a known position
-    and places a ground symbol there.
-    """
-    if not sources:
-        return
-
-    first_source_gnd = None
-    for comp in sources:
-        for n in comp.nodes:
-            if _is_ground(n) and n in node_positions:
-                first_source_gnd = node_positions[n]
-                break
-        if first_source_gnd:
-            break
-    if first_source_gnd:
-        d.add(elm.Ground().at(first_source_gnd))
-
-
 def draw_schematic(netlist: str, output_path: str | Path, fmt: str = "png") -> Path:
     """Draw a schematic from a SPICE netlist and save to file.
+
+    Uses the same layout and symbols as the KiCad export (via
+    ``svg_renderer.render_svg``) in KiCad's colours; PNG is rendered from
+    the SVG with cairosvg.
 
     Args:
         netlist: SPICE netlist string.
@@ -284,30 +148,18 @@ def draw_schematic(netlist: str, output_path: str | Path, fmt: str = "png") -> P
     Raises:
         ValueError: If the netlist contains no components.
     """
-    components = parse_netlist(netlist)
-    if not components:
+    # Imported here: svg_renderer depends on this module
+    from spicebridge.svg_renderer import render_svg
+
+    if not parse_netlist(netlist):
         raise ValueError("Netlist contains no components to draw")
 
     output_path = Path(output_path)
+    svg = render_svg(netlist, width=None, height=None, theme="light")
+    if fmt == "svg":
+        output_path.write_text(svg, encoding="utf-8")
+    else:
+        import cairosvg
 
-    sources, series, shunt = _classify_components(components)
-
-    d = schemdraw.Drawing(backend="svg", show=False)
-
-    # Track node positions for connecting shunt components
-    node_positions: dict[str, tuple[float, float]] = {}
-
-    # 1. Draw sources on the left going UP from ground
-    _draw_sources(d, sources, node_positions)
-
-    # 2. Draw series components going RIGHT
-    _draw_series(d, series, node_positions)
-
-    # 3. Draw shunt components going DOWN to ground
-    _draw_shunt(d, shunt, node_positions)
-
-    # Add a ground at the source bottom if we drew sources
-    _draw_source_grounds(d, sources, node_positions)
-
-    d.save(str(output_path))
+        cairosvg.svg2png(bytestring=svg.encode("utf-8"), write_to=str(output_path))
     return output_path
