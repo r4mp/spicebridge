@@ -8,11 +8,14 @@ from pathlib import Path
 import pytest
 
 from spicebridge.kicad_export import (
-    _LIB_SYMBOL_TEMPLATES,
     _SYMBOL_MAP,
+    _body_box,
     _build_lib_symbols,
+    _crosses_box,
     _find_ground_pins,
+    _find_net_labels,
     _layout_components,
+    _pin_positions,
     _resolve_symbol_info,
     _route_wires,
     _snap_to_grid,
@@ -476,7 +479,10 @@ _SPICE_PIN_ORDER = {
     "D": ["A", "K"],
     "Q": ["C", "B", "E"],
     "M": ["D", "G", "S"],
-    "X": ["1", "2", "3", "4", "5"],
+    "J": ["1", "2", "3"],
+    "E": ["1", "2", "3", "4"],
+    "G": ["1", "2", "3", "4"],
+    "X": [str(i) for i in range(1, 21)],
 }
 
 DIODE_SUBCKT_CIRCUIT = """\
@@ -486,6 +492,50 @@ R1 in a 1k
 D1 a k 1N4148
 R2 k 0 10k
 X1 a k out 0 mysub
+"""
+
+CONTROLLED_SOURCES_CIRCUIT = """\
+* Controlled and behavioral sources
+V1 in 0 dc 1
+R1 in a 1k
+E1 b 0 a 0 10
+R2 b c 1k
+G1 c 0 a b 1m
+Vsense c d dc 0
+F1 d 0 Vsense 2
+H1 e 0 Vsense 100
+R3 e d 1k
+B1 f 0 V=V(a)*2
+R4 f a 1k
+"""
+
+JFET_CIRCUIT = """\
+* JFET pair, polarity from .model cards
+.model JN njf(vto=-2)
+.model JP pjf(vto=2)
+V1 vdd 0 dc 9
+J1 vdd gate src JN
+J2 0 gate src JP
+R1 src 0 1k
+R2 vdd gate 1meg
+"""
+
+WIDE_SUBCKT_CIRCUIT = """\
+* Subcircuit with nine ports
+V1 a 0 dc 1
+R1 a b 1k
+X1 a b c d e f g h 0 big
+R2 h 0 1k
+R3 c d 1k
+"""
+
+COUPLED_INDUCTORS_CIRCUIT = """\
+* Transformer
+V1 a 0 ac 1
+L1 a 0 1m
+L2 b 0 1m
+K1 L1 L2 0.9
+R1 b 0 1k
 """
 
 
@@ -570,6 +620,8 @@ def _kicad_nets(tree) -> list[set[str]]:
 def _expected_nets(netlist: str) -> list[set[str]]:
     nets: dict[str, set[str]] = {}
     for comp in parse_netlist(netlist):
+        if comp.comp_type == "K":  # coupling only, not drawn
+            continue
         order = _SPICE_PIN_ORDER.get(comp.comp_type, ["1", "2"])
         for node, number in zip(comp.nodes, order, strict=False):
             key = "0" if node.lower() in ("0", "gnd") else node
@@ -587,6 +639,10 @@ def _expected_nets(netlist: str) -> list[set[str]]:
         MOSFET_CIRCUIT,
         PNP_CIRCUIT,
         DIODE_SUBCKT_CIRCUIT,
+        CONTROLLED_SOURCES_CIRCUIT,
+        JFET_CIRCUIT,
+        WIDE_SUBCKT_CIRCUIT,
+        COUPLED_INDUCTORS_CIRCUIT,
     ],
 )
 def test_exported_connectivity_matches_netlist(netlist, tmp_path):
@@ -601,11 +657,117 @@ def test_exported_connectivity_matches_netlist(netlist, tmp_path):
 
 
 def test_symbol_map_offsets_match_lib_templates():
-    tree = _sexp("(root " + _build_lib_symbols(set(_LIB_SYMBOL_TEMPLATES)) + ")")
+    infos = [*_SYMBOL_MAP.values()]
+    infos += [_resolve_symbol_info("X", "sub", n_nodes=n) for n in (2, 5, 6, 9)]
+    lib_ids = {info.lib_id for info in infos}
+    tree = _sexp("(root " + _build_lib_symbols(lib_ids) + ")")
     lib_pins = _lib_pin_positions(tree)
-    infos = [*_SYMBOL_MAP.values(), _resolve_symbol_info("X", "sub")]
+    assert set(lib_pins) == lib_ids
     for info in infos:
         pins = lib_pins[info.lib_id]
         for number, (dx, dy) in zip(info.pin_numbers, info.pin_offsets, strict=True):
             lx, ly = pins[number]
             assert (dx, dy) == pytest.approx((lx, -ly)), (info.lib_id, number)
+
+
+# --- Symbols, warnings and layout for the less common element types ---
+
+
+def _placed_lib_ids(netlist, tmp_path) -> dict[str, str]:
+    path, _ = export_kicad_schematic(netlist, output_dir=tmp_path)
+    tree = _sexp(path.read_text())
+    result = {}
+    for sym in _children(tree, "symbol"):
+        ref = next(
+            p[2].strip('"') for p in _children(sym, "property") if p[1] == '"Reference"'
+        )
+        result[ref] = _children(sym, "lib_id")[0][1].strip('"')
+    return result
+
+
+def test_controlled_sources_have_own_symbols(tmp_path):
+    lib_ids = _placed_lib_ids(CONTROLLED_SOURCES_CIRCUIT, tmp_path)
+    assert lib_ids["E1"] == "Simulation_SPICE:ESOURCE"
+    assert lib_ids["G1"] == "Simulation_SPICE:GSOURCE"
+    assert lib_ids["F1"] == "Simulation_SPICE:FSOURCE"
+    assert lib_ids["H1"] == "Simulation_SPICE:HSOURCE"
+    assert lib_ids["B1"] == "Simulation_SPICE:BSOURCE"
+
+
+def test_jfet_polarity_from_model_card(tmp_path):
+    lib_ids = _placed_lib_ids(JFET_CIRCUIT, tmp_path)
+    assert lib_ids["J1"] == "Simulation_SPICE:NJFET"
+    assert lib_ids["J2"] == "Simulation_SPICE:PJFET"
+
+
+def test_bjt_polarity_from_model_card(tmp_path):
+    netlist = PNP_CIRCUIT.replace("PNP_MODEL", "2N3906") + ".model 2N3906 PNP(BF=200)\n"
+    assert _placed_lib_ids(netlist, tmp_path)["Q1"] == "Device:Q_PNP_BCE"
+
+
+def test_wide_subckt_gets_generated_symbol(tmp_path):
+    lib_ids = _placed_lib_ids(WIDE_SUBCKT_CIRCUIT, tmp_path)
+    assert lib_ids["X1"] == "Simulation_SPICE:SUBCKT_9"
+
+
+def test_warnings_for_skipped_and_placeholder_elements(tmp_path):
+    netlist = COUPLED_INDUCTORS_CIRCUIT + "T1 b 0 c 0 Z0=50 TD=1n\nR2 c 0 50\n"
+    _, warnings = export_kicad_schematic(netlist, output_dir=tmp_path)
+    assert any(w.startswith("K1:") for w in warnings)
+    assert any(w.startswith("T1:") and "placeholder" in w for w in warnings)
+    assert not any(w.startswith(("L1:", "R1:", "V1:")) for w in warnings)
+
+
+_LAYOUT_CIRCUITS = [
+    ISSUE5_NETLIST,
+    BJT_AMPLIFIER,
+    CONTROLLED_SOURCES_CIRCUIT,
+    JFET_CIRCUIT,
+    WIDE_SUBCKT_CIRCUIT,
+    DIODE_SUBCKT_CIRCUIT,
+]
+
+
+def _placed(netlist):
+    comps = [c for c in parse_netlist(netlist) if c.comp_type != "K"]
+    return _layout_components(comps)
+
+
+@pytest.mark.parametrize("netlist", _LAYOUT_CIRCUITS)
+def test_component_bodies_do_not_overlap(netlist):
+    boxes = [_body_box(pc) for pc in _placed(netlist)]
+    for i, (ax1, ay1, ax2, ay2) in enumerate(boxes):
+        for bx1, by1, bx2, by2 in boxes[i + 1 :]:
+            overlap = ax1 < bx2 and bx1 < ax2 and ay1 < by2 and by1 < ay2
+            assert not overlap
+
+
+@pytest.mark.parametrize("netlist", _LAYOUT_CIRCUITS)
+def test_no_wire_crosses_a_component(netlist):
+    placed = _placed(netlist)
+    wires, _ = _route_wires(placed)
+    for wire in wires:
+        for pc in placed:
+            assert not _crosses_box(wire, _body_box(pc)), (wire, pc.component.ref)
+
+
+_DIRECTION_VECTORS = {0: (1, 0), 90: (0, -1), 180: (-1, 0), 270: (0, 1)}
+
+
+@pytest.mark.parametrize("netlist", _LAYOUT_CIRCUITS)
+def test_labels_and_ground_point_away_from_component(netlist):
+    placed = _placed(netlist)
+    origins = {}
+    for pc in placed:
+        for pos in _pin_positions(pc):
+            origins[pos] = (pc.x, pc.y)
+    every_net = {node for pc in placed for node in pc.component.nodes}
+    labels = _find_net_labels(placed, every_net)
+    markers = [(x, y, d) for x, y, _name, d in labels]
+    markers += _find_ground_pins(placed)
+    assert markers
+    for x, y, direction in markers:
+        ox, oy = origins[(x, y)]
+        dx, dy = _DIRECTION_VECTORS[direction]
+        # Pointing towards the component origin would draw over the body
+        assert (ox - x) * dx + (oy - y) * dy <= 0, (x, y, direction)
