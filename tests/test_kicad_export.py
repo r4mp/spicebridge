@@ -11,13 +11,15 @@ from spicebridge.kicad_export import (
     _SYMBOL_MAP,
     _body_box,
     _build_lib_symbols,
-    _crosses_box,
     _find_ground_pins,
     _find_net_labels,
     _layout_components,
     _model_types,
+    _obstacle_boxes,
+    _pin_directions,
     _pin_positions,
     _resolve_symbol_info,
+    _route_nets,
     _route_wires,
     _snap_to_grid,
     _subckt_box,
@@ -170,8 +172,9 @@ class TestLayout:
         comps = parse_netlist(RC_LOWPASS)
         placed = _layout_components(comps)
         sources = [p for p in placed if p.component.comp_type in ("V", "I")]
+        assert sources
         for s in sources:
-            assert s.x == 50.8
+            assert s.x == min(p.x for p in placed)
 
     def test_snap_to_grid(self):
         assert _snap_to_grid(2.53) == 2.54
@@ -766,6 +769,17 @@ _LAYOUT_CIRCUITS = [
 ]
 
 
+def _crosses_box(wire, box, eps: float = 1e-6) -> bool:
+    """Return True if the axis-aligned wire runs through the box interior."""
+    (x1, y1), (x2, y2) = wire.start, wire.end
+    bx1, by1, bx2, by2 = box
+    lo_x, hi_x = max(min(x1, x2), bx1), min(max(x1, x2), bx2)
+    lo_y, hi_y = max(min(y1, y2), by1), min(max(y1, y2), by2)
+    if y1 == y2:
+        return by1 + eps < y1 < by2 - eps and lo_x < hi_x - eps
+    return bx1 + eps < x1 < bx2 - eps and lo_y < hi_y - eps
+
+
 def _placed(netlist):
     comps = [c for c in parse_netlist(netlist) if c.comp_type != "K"]
     return _layout_components(comps, _model_types(netlist), _subckt_ports(netlist))
@@ -786,7 +800,8 @@ def test_no_wire_crosses_a_component(netlist):
     wires, _ = _route_wires(placed)
     for wire in wires:
         for pc in placed:
-            assert not _crosses_box(wire, _body_box(pc)), (wire, pc.component.ref)
+            for box in _obstacle_boxes(pc):
+                assert not _crosses_box(wire, box), (wire, pc.component.ref)
 
 
 _DIRECTION_VECTORS = {0: (1, 0), 90: (0, -1), 180: (-1, 0), 270: (0, 1)}
@@ -875,3 +890,88 @@ def test_value_with_quotes_is_escaped(tmp_path):
     netlist = '* t\nV1 a 0 dc 1\nB1 b 0 V="V(a)"\nR1 b 0 1k\n'
     path, _ = export_kicad_schematic(netlist, output_dir=tmp_path)
     _sexp(path.read_text())  # parses, i.e. quotes did not break the file
+
+
+# --- Signal-flow layout and routing ---
+
+OPAMP_CASCADE_CIRCUIT = """\
+* Two inverting stages with pull-ups to a supply
+V1 in 0 ac 1
+V2 vcc 0 dc 15
+R1 in m0 10k
+R2 m0 o0 22k
+C1 m0 o0 1n
+E1 o0 0 0 m0 1e5
+R3 o0 vcc 100k
+R4 o0 m1 10k
+R5 m1 o1 22k
+E2 o1 0 0 m1 1e5
+R6 o1 vcc 100k
+"""
+
+
+def _ladder(n: int) -> str:
+    lines = ["* RC ladder", "V1 n0 0 ac 1"]
+    for i in range(n):
+        lines += [f"R{i + 1} n{i} n{i + 1} 1k", f"C{i + 1} n{i + 1} 0 1n"]
+    return "\n".join(lines) + "\n"
+
+
+def _by_ref(placed):
+    return {pc.component.ref: pc for pc in placed}
+
+
+@pytest.mark.parametrize(
+    "netlist", [*_LAYOUT_CIRCUITS, RC_LOWPASS, VOLTAGE_DIVIDER, OPAMP_CASCADE_CIRCUIT]
+)
+def test_router_wires_every_net(netlist):
+    _, _, unrouted = _route_nets(_placed(netlist))
+    assert unrouted == set()
+
+
+def test_parts_follow_the_signal_flow():
+    parts = _by_ref(_placed(ISSUE5_NETLIST))
+    assert parts["V1"].x < parts["R1"].x < parts["R2"].x < parts["E1"].x
+    # The feedback capacitor spans n1 -> out above the main row
+    assert parts["C1"].y < parts["R1"].y
+    # The capacitor to ground hangs below the main row
+    assert parts["C2"].y > parts["R2"].y
+
+
+def test_supply_rail_does_not_merge_stages():
+    parts = _by_ref(_placed(OPAMP_CASCADE_CIRCUIT))
+    # Stage 2 lies right of stage 1 although both outputs pull up to vcc
+    assert parts["E1"].x < parts["R4"].x < parts["E2"].x
+    # Pull-ups stand above everything else, each above its own output
+    for ref in ("R3", "R6"):
+        assert parts[ref].y < parts["C1"].y < parts["R1"].y
+    assert abs(parts["R3"].x - parts["E1"].x) < abs(parts["R3"].x - parts["E2"].x)
+    assert abs(parts["R6"].x - parts["E2"].x) < abs(parts["R6"].x - parts["E1"].x)
+
+
+def test_controlled_source_inputs_point_left():
+    info = _resolve_symbol_info("E", "10", n_nodes=4)
+    (cp_x, _), (cm_x, _) = info.pin_offsets[2:4]
+    assert cp_x < 0 and cm_x < 0
+    e1 = _by_ref(_placed(ISSUE5_NETLIST))["E1"]
+    assert _pin_directions(e1)[2:4] == [180, 180]
+
+
+def test_paper_grows_with_the_drawing(tmp_path):
+    path, _ = export_kicad_schematic(RC_LOWPASS, output_dir=tmp_path)
+    assert '(paper "A4")' in path.read_text()
+    path, _ = export_kicad_schematic(_ladder(30), output_dir=tmp_path)
+    assert '(paper "A4")' not in path.read_text()
+
+
+def test_unroutable_nets_fall_back_to_labels(tmp_path, monkeypatch):
+    from spicebridge import kicad_export
+
+    monkeypatch.setattr(kicad_export._Router, "route", lambda *a, **k: None)
+    path, _ = export_kicad_schematic(ISSUE5_NETLIST, output_dir=tmp_path)
+    tree = _sexp(path.read_text())
+    assert not _children(tree, "wire")
+    expected = sorted(sorted(g) for g in _expected_nets(ISSUE5_NETLIST))
+    used = {pin for group in expected for pin in group}
+    actual = sorted(sorted(g & used) for g in _kicad_nets(tree) if g & used)
+    assert actual == expected
