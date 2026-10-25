@@ -552,13 +552,15 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
 }
 
 
-def _build_lib_symbols(used_lib_ids: set[str]) -> str:
+def _build_lib_symbols(used_lib_ids: set[str], include_gnd: bool = False) -> str:
     """Assemble lib_symbols section with only the templates actually used."""
     parts: list[str] = []
     parts.append("  (lib_symbols")
     for lib_id in sorted(used_lib_ids):
         if lib_id in _LIB_SYMBOL_TEMPLATES:
             parts.append(_LIB_SYMBOL_TEMPLATES[lib_id])
+    if include_gnd:
+        parts.append(_GND_LIB_SYMBOL)
     parts.append("  )")
     return "\n".join(parts)
 
@@ -595,7 +597,7 @@ def _emit_symbol_instance(placed: PlacedComponent, sheet_uuid: str) -> str:
     pin_lines: list[str] = []
     n_pins = min(len(comp.nodes), len(sym.pin_numbers))
     for i in range(n_pins):
-        pin_lines.append(f'        (pin "{sym.pin_numbers[i]}" (uuid "{_uid()}"))')
+        pin_lines.append(f'      (pin "{sym.pin_numbers[i]}" (uuid "{_uid()}"))')
 
     # Rotation angle for KiCad (uses degrees)
     angle = placed.rotation
@@ -616,7 +618,9 @@ def _emit_symbol_instance(placed: PlacedComponent, sheet_uuid: str) -> str:
         f'      (uuid "{sym_uuid}")',
     ]
     lines.extend(props)
-    lines.append("      (pin_names (offset 1.016))")
+    # KiCad requires (pin ...) nodes before (instances ...); (pin_names ...)
+    # is only valid in lib_symbols definitions, not in placed symbols.
+    lines.extend(pin_lines)
     lines.append("      (instances")
     lines.append('        (project ""')
     lines.append(f'          (path "/{sheet_uuid}"')
@@ -624,8 +628,6 @@ def _emit_symbol_instance(placed: PlacedComponent, sheet_uuid: str) -> str:
     lines.append("          )")
     lines.append("        )")
     lines.append("      )")
-    if pin_lines:
-        lines.extend(pin_lines)
     lines.append("    )")
     return "\n".join(lines)
 
@@ -657,7 +659,7 @@ def _emit_power_symbol(x: float, y: float, sheet_uuid: str) -> str:
         f"        (effects (font (size 1.27 1.27)) hide))\n"
         f'      (property "Datasheet" "" (at {x} {y} 0)\n'
         f"        (effects (font (size 1.27 1.27)) hide))\n"
-        f"      (pin_names (offset 0))\n"
+        f'      (pin "1" (uuid "{_uid()}"))\n'
         f"      (instances\n"
         f'        (project ""\n'
         f'          (path "/{sheet_uuid}"\n'
@@ -665,7 +667,6 @@ def _emit_power_symbol(x: float, y: float, sheet_uuid: str) -> str:
         f"          )\n"
         f"        )\n"
         f"      )\n"
-        f'      (pin "1" (uuid "{_uid()}"))\n'
         f"    )"
     )
 
@@ -786,11 +787,7 @@ def export_kicad_schematic(
     parts.append(_emit_header(sheet_uuid))
 
     # Lib symbols
-    lib_sym = _build_lib_symbols(used_lib_ids)
-    if ground_positions:
-        # Insert GND symbol into lib_symbols
-        lib_sym = lib_sym.replace("  )", _GND_LIB_SYMBOL + "\n  )", 1)
-    parts.append(lib_sym)
+    parts.append(_build_lib_symbols(used_lib_ids, include_gnd=bool(ground_positions)))
     parts.append("")
 
     # Symbol instances

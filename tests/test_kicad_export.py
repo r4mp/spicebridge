@@ -356,3 +356,96 @@ class TestIntegration:
         from spicebridge import export_kicad_schematic as fn
 
         assert callable(fn)
+
+
+# --- Regression tests for issue #5 ---
+
+ISSUE5_NETLIST = """\
+Sallen-Key Lowpass Butterworth fc~1kHz, OpAmp korrekt gegengekoppelt
+V1 in 0 dc 0 ac 1
+R1 in n1 10k
+R2 n1 n2 10k
+C1 n1 out 22n
+C2 n2 0 10n
+E1 out 0 n2 out 100k
+.ac dec 20 10 100k
+.end
+"""
+
+_PRIMITIVE_CHILDREN = {"pts", "stroke", "fill", "start", "mid", "end", "center", "radius"}
+
+
+def _sexp(text: str):
+    """Minimal S-expression parser (strings kept as str, atoms as str)."""
+    tokens = re.findall(r'"(?:[^"\\]|\\.)*"|[()]|[^\s()"]+', text)
+    stack: list[list] = [[]]
+    for tok in tokens:
+        if tok == "(":
+            stack.append([])
+        elif tok == ")":
+            node = stack.pop()
+            stack[-1].append(node)
+        else:
+            stack[-1].append(tok)
+    assert len(stack) == 1, "unbalanced parentheses"
+    return stack[0][0]
+
+
+def _children(node, name):
+    return [c for c in node if isinstance(c, list) and c and c[0] == name]
+
+
+@pytest.fixture
+def issue5_tree(tmp_path):
+    path, _ = export_kicad_schematic(ISSUE5_NETLIST, output_dir=tmp_path)
+    return _sexp(path.read_text())
+
+
+class TestIssue5:
+    def test_lib_symbols_only_contain_symbols(self, issue5_tree):
+        (lib,) = _children(issue5_tree, "lib_symbols")
+        names = [c[1] for c in lib[1:]]
+        assert all(c[0] == "symbol" for c in lib[1:])
+        assert '"power:GND"' in names
+
+    def test_drawing_primitives_are_closed(self, issue5_tree):
+        (lib,) = _children(issue5_tree, "lib_symbols")
+        for sym in lib[1:]:
+            for unit in _children(sym, "symbol"):
+                for prim in unit[2:]:
+                    if prim[0] == "pin":
+                        continue
+                    for child in prim[1:]:
+                        assert child[0] in _PRIMITIVE_CHILDREN, (sym[1], prim[0], child[0])
+
+    def test_placed_symbols_pin_before_instances_and_no_pin_names(self, issue5_tree):
+        placed = _children(issue5_tree, "symbol")
+        assert placed
+        for sym in placed:
+            keys = [c[0] for c in sym[1:] if isinstance(c, list)]
+            assert "pin_names" not in keys
+            assert "instances" in keys
+            pin_idx = [i for i, k in enumerate(keys) if k == "pin"]
+            assert pin_idx and max(pin_idx) < keys.index("instances")
+
+    def test_title_line_not_parsed_as_component(self, issue5_tree):
+        refs = []
+        for sym in _children(issue5_tree, "symbol"):
+            for prop in _children(sym, "property"):
+                if prop[1] == '"Reference"':
+                    refs.append(prop[2].strip('"'))
+        assert "Sallen-Key" not in refs
+        assert {"V1", "R1", "R2", "C1", "C2", "E1"} <= set(refs)
+
+
+def test_subckt_body_not_parsed_as_components():
+    netlist = """\
+* opamp test
+.subckt ideal_opamp inp inn out
+E1 out 0 inp inn 100k
+.ends ideal_opamp
+V1 in 0 dc 1
+X1 in out out ideal_opamp
+"""
+    refs = [c.ref for c in parse_netlist(netlist)]
+    assert refs == ["V1", "X1"]
