@@ -112,25 +112,25 @@ class TestSymbolMapping:
 
     def test_npn_default(self):
         info = _resolve_symbol_info("Q", "2N2222")
-        assert info.lib_id == "Device:Q_NPN_BCE"
+        assert info.lib_id == "Device:Q_NPN"
         assert len(info.pin_numbers) == 3
 
     def test_pnp_heuristic(self):
         info = _resolve_symbol_info("Q", "PNP_MODEL")
-        assert info.lib_id == "Device:Q_PNP_BCE"
+        assert info.lib_id == "Device:Q_PNP"
 
     def test_pnp_case_insensitive(self):
         info = _resolve_symbol_info("Q", "some_pnp_transistor")
-        assert info.lib_id == "Device:Q_PNP_BCE"
+        assert info.lib_id == "Device:Q_PNP"
 
     def test_nmos_default(self):
         info = _resolve_symbol_info("M", "NMOS_MODEL")
-        assert info.lib_id == "Device:Q_NMOS_GDS"
+        assert info.lib_id == "Device:Q_NMOS"
         assert len(info.pin_numbers) == 3
 
     def test_pmos_heuristic(self):
         info = _resolve_symbol_info("M", "PMOS_MODEL")
-        assert info.lib_id == "Device:Q_PMOS_GDS"
+        assert info.lib_id == "Device:Q_PMOS"
 
     def test_subcircuit_mapping(self):
         info = _resolve_symbol_info("X", "OPAMP")
@@ -291,7 +291,7 @@ class TestSExpression:
     def test_bjt_export(self):
         content = self._export(BJT_AMPLIFIER)
         assert '"Q1"' in content
-        assert "Q_NPN_BCE" in content
+        assert "Q_NPN" in content
 
     def test_net_labels(self):
         content = self._export(RC_LOWPASS)
@@ -308,7 +308,7 @@ class TestMosfetHandling:
                 MOSFET_CIRCUIT, output_dir=Path(tmpdir)
             )
             content = path.read_text(encoding="utf-8")
-            assert "Q_NMOS_GDS" in content
+            assert "Q_NMOS" in content
 
     def test_mosfet_bulk_warning(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -741,7 +741,7 @@ def test_jfet_polarity_from_model_card(tmp_path):
 
 def test_bjt_polarity_from_model_card(tmp_path):
     netlist = PNP_CIRCUIT.replace("PNP_MODEL", "2N3906") + ".model 2N3906 PNP(BF=200)\n"
-    assert _placed_lib_ids(netlist, tmp_path)["Q1"] == "Device:Q_PNP_BCE"
+    assert _placed_lib_ids(netlist, tmp_path)["Q1"] == "Device:Q_PNP"
 
 
 def test_wide_subckt_gets_generated_symbol(tmp_path):
@@ -975,3 +975,39 @@ def test_unroutable_nets_fall_back_to_labels(tmp_path, monkeypatch):
     used = {pin for group in expected for pin in group}
     actual = sorted(sorted(g & used) for g in _kicad_nets(tree) if g & used)
     assert actual == expected
+
+
+# --- KiCad ERC: library names and GND driver ---
+
+
+def test_transistors_use_kicad_9_device_symbols(tmp_path):
+    netlist = (
+        "* transistors\nV1 vcc 0 dc 12\nQ1 vcc b e 2N2222\nQ2 0 b e PNPX\n"
+        "M1 vcc b e e NM\nM2 0 b e e PM\nR1 vcc b 1k\nR2 e 0 1k\n"
+        ".model PNPX pnp\n.model NM nmos\n.model PM pmos\n"
+    )
+    lib_ids = _placed_lib_ids(netlist, tmp_path)
+    assert lib_ids["Q1"] == "Device:Q_NPN"
+    assert lib_ids["Q2"] == "Device:Q_PNP"
+    assert lib_ids["M1"] == "Device:Q_NMOS"
+    assert lib_ids["M2"] == "Device:Q_PMOS"
+
+
+def test_power_flag_drives_the_gnd_net(tmp_path):
+    path, _ = export_kicad_schematic(RC_LOWPASS, output_dir=tmp_path)
+    tree = _sexp(path.read_text())
+    flags = [
+        sym
+        for sym in _children(tree, "symbol")
+        if _children(sym, "lib_id")[0][1] == '"power:PWR_FLAG"'
+    ]
+    assert len(flags) == 1
+    # The flag sits on the same net as the grounded pins of the circuit
+    (group,) = [g for g in _kicad_nets(tree) if "#FLG01.1" in g]
+    assert {"V1.2", "C1.2"} <= group
+
+
+def test_no_power_flag_without_ground(tmp_path):
+    netlist = "* floating\nV1 a b dc 1\nR1 a b 1k\n"
+    path, _ = export_kicad_schematic(netlist, output_dir=tmp_path)
+    assert "PWR_FLAG" not in path.read_text()

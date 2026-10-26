@@ -81,27 +81,27 @@ _SYMBOL_MAP: dict[str, KiCadSymbolInfo] = {
         "Simulation_SPICE:IDC", ["1", "2"], [(0, -3.81), (0, 3.81)], 3.81, 2.54
     ),
     "Q_NPN": KiCadSymbolInfo(
-        "Device:Q_NPN_BCE",
+        "Device:Q_NPN",
         ["C", "B", "E"],
-        [(2.54, -2.54), (-2.54, 0), (2.54, 2.54)],
+        [(2.54, -5.08), (-5.08, 0), (2.54, 5.08)],
         5.08,
     ),
     "Q_PNP": KiCadSymbolInfo(
-        "Device:Q_PNP_BCE",
+        "Device:Q_PNP",
         ["C", "B", "E"],
-        [(2.54, -2.54), (-2.54, 0), (2.54, 2.54)],
+        [(2.54, -5.08), (-5.08, 0), (2.54, 5.08)],
         5.08,
     ),
     "M_NMOS": KiCadSymbolInfo(
-        "Device:Q_NMOS_GDS",
+        "Device:Q_NMOS",
         ["D", "G", "S"],
-        [(2.54, -2.54), (-2.54, 0), (2.54, 2.54)],
+        [(2.54, -5.08), (-5.08, 0), (2.54, 5.08)],
         5.08,
     ),
     "M_PMOS": KiCadSymbolInfo(
-        "Device:Q_PMOS_GDS",
+        "Device:Q_PMOS",
         ["D", "G", "S"],
-        [(2.54, -2.54), (-2.54, 0), (2.54, 2.54)],
+        [(2.54, -5.08), (-5.08, 0), (2.54, 5.08)],
         5.08,
     ),
     # Controlled sources use the pin numbering of KiCad's Simulation_SPICE
@@ -1150,10 +1150,17 @@ def _polyline(points: list[tuple[float, float]], fill: str = "none") -> str:
     )
 
 
-def _pin(number: str, x: float, y: float, angle: int, etype: str = "passive") -> str:
-    """Lib symbol pin with a 2.54 mm lead and hidden name."""
+def _pin(
+    number: str,
+    x: float,
+    y: float,
+    angle: int,
+    etype: str = "passive",
+    length: float = 2.54,
+) -> str:
+    """Lib symbol pin with a hidden name (2.54 mm lead by default)."""
     return (
-        f"        (pin {etype} line (at {x} {y} {angle}) (length 2.54) "
+        f"        (pin {etype} line (at {x} {y} {angle}) (length {length}) "
         f'(name "~" {_FONT}) (number "{number}" {_FONT}))'
     )
 
@@ -1215,6 +1222,56 @@ def _source_symbol(lib_id: str, ref: str, marks: list[str], control: bool) -> st
     return _lib_symbol(lib_id, ref, 3.81, graphics, pins)
 
 
+def _bjt_symbol(lib_id: str, pnp: bool) -> str:
+    """BJT with the pinout of KiCad's Device:Q_NPN/Q_PNP: C (top right),
+    B (left), E (bottom right)."""
+    # Arrow on the emitter: pointing out (NPN) or in (PNP)
+    arrow = (
+        [(1.016, -1.016), (2.137, -1.419), (1.419, -2.137), (1.016, -1.016)]
+        if pnp
+        else [(2.286, -2.286), (1.883, -1.165), (1.165, -1.883), (2.286, -2.286)]
+    )
+    graphics = [
+        _polyline([(0.635, 1.905), (0.635, -1.905)]),
+        _polyline([(0.635, 0.635), (2.54, 2.54)]),
+        _polyline([(0.635, -0.635), (2.54, -2.54)]),
+        _polyline(arrow, "outline"),
+    ]
+    pins = [
+        _pin("B", -5.08, 0, 0, "input", length=5.715),
+        _pin("C", 2.54, 5.08, 270),
+        _pin("E", 2.54, -5.08, 90),
+    ]
+    return _lib_symbol(lib_id, "Q", 5.08, graphics, pins)
+
+
+def _mosfet_symbol(lib_id: str, p_channel: bool) -> str:
+    """MOSFET with the pinout of KiCad's Device:Q_NMOS/Q_PMOS: D (top right),
+    G (left), S (bottom right); body tied to the source."""
+    # Arrow on the body connection: pointing in (N) or out (P)
+    arrow = (
+        [(2.286, 0), (1.27, 0.508), (1.27, -0.508), (2.286, 0)]
+        if p_channel
+        else [(1.016, 0), (2.032, 0.508), (2.032, -0.508), (1.016, 0)]
+    )
+    graphics = [
+        _polyline([(0.254, 1.905), (0.254, -1.905)]),
+        _polyline([(0.762, 2.286), (0.762, 1.27)]),
+        _polyline([(0.762, 0.508), (0.762, -0.508)]),
+        _polyline([(0.762, -1.27), (0.762, -2.286)]),
+        _polyline([(0.762, 1.778), (2.54, 1.778), (2.54, 2.54)]),
+        _polyline([(0.762, -1.778), (2.54, -1.778), (2.54, -2.54)]),
+        _polyline([(0.762, 0), (2.54, 0), (2.54, -1.778)]),
+        _polyline(arrow, "outline"),
+    ]
+    pins = [
+        _pin("G", -5.08, 0, 0, "input", length=5.334),
+        _pin("D", 2.54, 5.08, 270),
+        _pin("S", 2.54, -5.08, 90),
+    ]
+    return _lib_symbol(lib_id, "Q", 5.08, graphics, pins)
+
+
 def _jfet_symbol(lib_id: str, p_channel: bool) -> str:
     """JFET with D (1, top right), G (2, left), S (3, bottom right)."""
     arrow = (
@@ -1255,6 +1312,10 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
     ),
     "Simulation_SPICE:NJFET": _jfet_symbol("Simulation_SPICE:NJFET", False),
     "Simulation_SPICE:PJFET": _jfet_symbol("Simulation_SPICE:PJFET", True),
+    "Device:Q_NPN": _bjt_symbol("Device:Q_NPN", pnp=False),
+    "Device:Q_PNP": _bjt_symbol("Device:Q_PNP", pnp=True),
+    "Device:Q_NMOS": _mosfet_symbol("Device:Q_NMOS", p_channel=False),
+    "Device:Q_PMOS": _mosfet_symbol("Device:Q_PMOS", p_channel=True),
     "Device:R": """
     (symbol "Device:R" (pin_numbers hide) (pin_names (offset 0)) (exclude_from_sim no) (in_bom yes) (on_board yes)
       (property "Reference" "R" (at 2.032 0 90) (effects (font (size 1.27 1.27))))
@@ -1388,116 +1449,6 @@ _LIB_SYMBOL_TEMPLATES: dict[str, str] = {
       (symbol "IDC_1_1"
         (pin passive line (at 0 3.81 270) (length 1.27) (name "~" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
         (pin passive line (at 0 -3.81 90) (length 1.27) (name "~" (effects (font (size 1.27 1.27)))) (number "2" (effects (font (size 1.27 1.27)))))
-      )
-    )""",
-    "Device:Q_NPN_BCE": """
-    (symbol "Device:Q_NPN_BCE" (pin_numbers hide) (pin_names (offset 0) hide) (exclude_from_sim no) (in_bom yes) (on_board yes)
-      (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Value" "Q_NPN_BCE" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
-      (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-      (symbol "Q_NPN_BCE_0_1"
-        (polyline (pts (xy 0.635 0.635) (xy 2.54 2.54))
-          (stroke (width 0) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.635 -0.635) (xy 2.54 -2.54))
-          (stroke (width 0) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.635 1.905) (xy 0.635 -1.905))
-          (stroke (width 0.3048) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 1.27 -1.524) (xy 2.286 -2.286) (xy 1.778 -0.762))
-          (stroke (width 0) (type default)) (fill (type outline))
-        )
-      )
-      (symbol "Q_NPN_BCE_1_1"
-        (pin passive line (at -2.54 0 0) (length 3.175) (name "B" (effects (font (size 1.27 1.27)))) (number "B" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 2.54 270) (length 2.54) (name "C" (effects (font (size 1.27 1.27)))) (number "C" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 -2.54 90) (length 2.54) (name "E" (effects (font (size 1.27 1.27)))) (number "E" (effects (font (size 1.27 1.27)))))
-      )
-    )""",
-    "Device:Q_PNP_BCE": """
-    (symbol "Device:Q_PNP_BCE" (pin_numbers hide) (pin_names (offset 0) hide) (exclude_from_sim no) (in_bom yes) (on_board yes)
-      (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Value" "Q_PNP_BCE" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
-      (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-      (symbol "Q_PNP_BCE_0_1"
-        (polyline (pts (xy 0.635 0.635) (xy 2.54 2.54))
-          (stroke (width 0) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.635 -0.635) (xy 2.54 -2.54))
-          (stroke (width 0) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.635 1.905) (xy 0.635 -1.905))
-          (stroke (width 0.3048) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 2.286 1.524) (xy 1.778 -0.762) (xy 1.27 1.524))
-          (stroke (width 0) (type default)) (fill (type outline))
-        )
-      )
-      (symbol "Q_PNP_BCE_1_1"
-        (pin passive line (at -2.54 0 0) (length 3.175) (name "B" (effects (font (size 1.27 1.27)))) (number "B" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 2.54 270) (length 2.54) (name "C" (effects (font (size 1.27 1.27)))) (number "C" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 -2.54 90) (length 2.54) (name "E" (effects (font (size 1.27 1.27)))) (number "E" (effects (font (size 1.27 1.27)))))
-      )
-    )""",
-    "Device:Q_NMOS_GDS": """
-    (symbol "Device:Q_NMOS_GDS" (pin_numbers hide) (pin_names (offset 0) hide) (exclude_from_sim no) (in_bom yes) (on_board yes)
-      (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Value" "Q_NMOS_GDS" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
-      (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-      (symbol "Q_NMOS_GDS_0_1"
-        (polyline (pts (xy 0.254 0) (xy -2.54 0))
-          (stroke (width 0) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.254 1.905) (xy 0.254 -1.905))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.762 -1.27) (xy 0.762 -2.286))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.762 0.508) (xy 0.762 -0.508))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.762 2.286) (xy 0.762 1.27))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-      )
-      (symbol "Q_NMOS_GDS_1_1"
-        (pin passive line (at -2.54 0 0) (length 2.794) (name "G" (effects (font (size 1.27 1.27)))) (number "G" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 2.54 270) (length 2.54) (name "D" (effects (font (size 1.27 1.27)))) (number "D" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 -2.54 90) (length 2.54) (name "S" (effects (font (size 1.27 1.27)))) (number "S" (effects (font (size 1.27 1.27)))))
-      )
-    )""",
-    "Device:Q_PMOS_GDS": """
-    (symbol "Device:Q_PMOS_GDS" (pin_numbers hide) (pin_names (offset 0) hide) (exclude_from_sim no) (in_bom yes) (on_board yes)
-      (property "Reference" "Q" (at 5.08 1.905 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Value" "Q_PMOS_GDS" (at 5.08 0 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Footprint" "" (at 5.08 -1.905 0) (effects (font (size 1.27 1.27)) hide))
-      (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-      (symbol "Q_PMOS_GDS_0_1"
-        (polyline (pts (xy 0.254 0) (xy -2.54 0))
-          (stroke (width 0) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.254 1.905) (xy 0.254 -1.905))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.762 -1.27) (xy 0.762 -2.286))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.762 0.508) (xy 0.762 -0.508))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-        (polyline (pts (xy 0.762 2.286) (xy 0.762 1.27))
-          (stroke (width 0.254) (type default)) (fill (type none))
-        )
-      )
-      (symbol "Q_PMOS_GDS_1_1"
-        (pin passive line (at -2.54 0 0) (length 2.794) (name "G" (effects (font (size 1.27 1.27)))) (number "G" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 2.54 270) (length 2.54) (name "D" (effects (font (size 1.27 1.27)))) (number "D" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 2.54 -2.54 90) (length 2.54) (name "S" (effects (font (size 1.27 1.27)))) (number "S" (effects (font (size 1.27 1.27)))))
       )
     )""",
 }
@@ -1709,6 +1660,31 @@ def _emit_power_symbol(
     )
 
 
+def _emit_power_flag(x: float, y: float, sheet_uuid: str) -> str:
+    """Emit a PWR_FLAG whose pin sits at (x, y), pointing up."""
+    return (
+        f'    (symbol (lib_id "power:PWR_FLAG") (at {x} {y} 0)\n'
+        f'      (uuid "{_uid()}")\n'
+        f'      (property "Reference" "#FLG01" (at {x} {_mm(y - 1.905)} 0)\n'
+        f"        (effects (font (size 1.27 1.27)) hide))\n"
+        f'      (property "Value" "PWR_FLAG" (at {x} {_mm(y - 3.81)} 0)\n'
+        f"        (effects (font (size 1.27 1.27))))\n"
+        f'      (property "Footprint" "" (at {x} {y} 0)\n'
+        f"        (effects (font (size 1.27 1.27)) hide))\n"
+        f'      (property "Datasheet" "~" (at {x} {y} 0)\n'
+        f"        (effects (font (size 1.27 1.27)) hide))\n"
+        f'      (pin "1" (uuid "{_uid()}"))\n'
+        f"      (instances\n"
+        f'        (project ""\n'
+        f'          (path "/{sheet_uuid}"\n'
+        f'            (reference "#FLG01") (unit 1)\n'
+        f"          )\n"
+        f"        )\n"
+        f"      )\n"
+        f"    )"
+    )
+
+
 def _emit_junction(x: float, y: float) -> str:
     """Emit a junction marker."""
     return (
@@ -1763,6 +1739,22 @@ _GND_LIB_SYMBOL = """
       )
       (symbol "GND_1_1"
         (pin power_in line (at 0 0 270) (length 0) (name "GND" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
+      )
+    )"""
+
+_PWR_FLAG_LIB_SYMBOL = """
+    (symbol "power:PWR_FLAG" (power) (pin_numbers hide) (pin_names (offset 0) hide) (exclude_from_sim no) (in_bom yes) (on_board yes)
+      (property "Reference" "#FLG" (at 0 1.905 0) (effects (font (size 1.27 1.27)) hide))
+      (property "Value" "PWR_FLAG" (at 0 3.81 0) (effects (font (size 1.27 1.27))))
+      (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+      (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
+      (symbol "PWR_FLAG_0_1"
+        (polyline (pts (xy 0 0) (xy 0 1.27) (xy -1.016 1.905) (xy 0 2.54) (xy 1.016 1.905) (xy 0 1.27))
+          (stroke (width 0) (type default)) (fill (type none))
+        )
+      )
+      (symbol "PWR_FLAG_1_1"
+        (pin power_out line (at 0 0 90) (length 0) (name "pwr" (effects (font (size 1.27 1.27)))) (number "1" (effects (font (size 1.27 1.27)))))
       )
     )"""
 
@@ -1824,6 +1816,11 @@ def export_kicad_schematic(
     for gx, gy, direction in scene.ground_pins:
         parts.append(_emit_power_symbol(gx, gy, sheet_uuid, direction))
         parts.append("")
+    if scene.power_flag:
+        fx, fy = scene.power_flag
+        parts.append(_emit_power_symbol(fx, fy, sheet_uuid))
+        parts.append(_emit_power_flag(fx, fy, sheet_uuid))
+        parts.append("")
 
     # Net labels
     for lx, ly, name, direction in scene.net_labels:
@@ -1862,6 +1859,8 @@ class Scene:
     # lib_id -> lib symbol definition, including power:GND when used
     lib_symbols: dict[str, str]
     warnings: list[str]
+    # Where a PWR_FLAG marks GND as driven (KiCad ERC), next to the drawing
+    power_flag: tuple[float, float] | None = None
 
 
 def build_scene(netlist: str) -> Scene:
@@ -1952,9 +1951,26 @@ def build_scene(netlist: str) -> Scene:
         text = _lib_symbol_text(lib_id, pin_names.get(lib_id))
         if text is not None:
             lib_symbols[lib_id] = text
+    power_flag = None
     if ground_pins:
         lib_symbols["power:GND"] = _GND_LIB_SYMBOL
+        lib_symbols["power:PWR_FLAG"] = _PWR_FLAG_LIB_SYMBOL
+        # Without a power output on GND, KiCad's ERC reports the GND symbols'
+        # power input pins as not driven. A GND symbol with a PWR_FLAG below
+        # the bottom-left corner of the drawing joins the GND net by name.
+        boxes = [_body_box(pc) for pc in placed]
+        power_flag = (
+            _snap_to_grid(min(b[0] for b in boxes)),
+            _ceil_to_grid(max(b[3] for b in boxes) + 4 * _GRID),
+        )
 
     return Scene(
-        placed, wires, junctions, ground_pins, net_labels, lib_symbols, warnings
+        placed,
+        wires,
+        junctions,
+        ground_pins,
+        net_labels,
+        lib_symbols,
+        warnings,
+        power_flag,
     )
